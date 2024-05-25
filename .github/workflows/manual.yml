@@ -1,0 +1,25 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 */2 * * ?' # 每周同步一次，可以根据需要调整时间
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: main # 你的默认分支名称，通常是 main 或 master
+
+      - name: Sync with upstream
+        run: |
+          git config --global user.name 'snailyp'
+          git config --global user.email '2291314224@qq.com'
+          git remote add upstream https://github.com/lanqian528/chat2api.git
+          git fetch upstream
+          git checkout main
+          git merge upstream/main
+          git push origin main
