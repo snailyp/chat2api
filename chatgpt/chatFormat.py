@@ -77,6 +77,13 @@ async def wss_stream_response(websocket, conversation_id):
                 data = resultObj.get("data", {})
                 if conversation_id != data.get("conversation_id", ""):
                     continue
+                sequenceId = resultObj.get('sequenceId')
+                if sequenceId and sequenceId % 80 == 0:
+                    await websocket.send(
+                        json.dumps(
+                            {"type": "sequenceAck", "sequenceId": sequenceId}
+                        )
+                    )
                 decoded_bytes = pybase64.b64decode(data.get("body", None))
                 yield decoded_bytes
             else:
@@ -87,6 +94,7 @@ async def wss_stream_response(websocket, conversation_id):
         except websockets.ConnectionClosed as e:
             if e.code == 1000:
                 logger.error("WebSocket closed normally with code 1000 (OK)")
+                yield b"data: [DONE]\n\n"
             else:
                 logger.error(f"WebSocket closed with error code {e.code}")
         except Exception as e:
@@ -101,11 +109,13 @@ async def stream_response(service, response, model, max_tokens):
     created_time = int(time.time())
     completion_tokens = -1
     len_last_content = 0
+    len_last_citation = 0
+    last_message_id = None
     last_content_type = None
     last_recipient = None
     start = False
     end = False
-    message_id = None
+
     async for chunk in response:
         chunk = chunk.decode("utf-8")
         if end:
@@ -129,9 +139,9 @@ async def stream_response(service, response, model, max_tokens):
                     continue
 
                 conversation_id = chunk_old_data.get("conversation_id")
+                message_id = message.get("id")
                 content = message.get("content", {})
                 recipient = message.get("recipient", "")
-                current_message_id = message.get('id')
 
                 if not message and chunk_old_data.get("type") == "moderation":
                     delta = {"role": "assistant", "content": moderation_message}
@@ -142,12 +152,19 @@ async def stream_response(service, response, model, max_tokens):
                     if outer_content_type == "text":
                         part = content.get("parts", [])[0]
                         if not part:
-                            message_id = message.get("id")
                             new_text = ""
                         else:
-                            if message_id and message_id != message.get("id"):
+                            if last_message_id and last_message_id != message_id:
                                 continue
-                            new_text = part[len_last_content:]
+                            citation = message.get("metadata", {}).get("citations", [])
+                            if len(citation) > len_last_citation:
+                                inside_metadata = citation[-1].get("metadata", {})
+                                citation_title = inside_metadata.get("title", "")
+                                citation_url = inside_metadata.get("url", "")
+                                new_text = f' **[[""]]({citation_url} "{citation_title}")** '
+                                len_last_citation = len(citation)
+                            else:
+                                new_text = part[len_last_content:]
                             len_last_content = len(part)
                     else:
                         text = content.get("text", "")
@@ -193,17 +210,27 @@ async def stream_response(service, response, model, max_tokens):
                         part = content.get("parts", [])[0]
                         new_text = part[len_last_content:]
                         if not new_text:
-                            delta = {}
+                            matches = re.findall(r'\(sandbox:(.*?)\)', part)
+                            if matches:
+                                file_url_content = ""
+                                for i, sandbox_path in enumerate(matches):
+                                    file_download_url = await service.get_response_file_url(conversation_id, message_id, sandbox_path)
+                                    if file_download_url:
+                                        file_url_content += f"\n```\n![File {i+1}]({file_download_url})\n"
+                                delta = {"content": file_url_content}
+                            else:
+                                delta = {}
                         else:
                             delta = {"content": new_text}
                         finish_reason = "stop"
                         end = True
                     else:
-                        message_id = None
+                        last_message_id = None
                         len_last_content = 0
                         continue
                 else:
                     continue
+                last_message_id = message_id
                 if not end and not delta.get("content"):
                     delta = {"role": "assistant", "content": ""}
                 chunk_new_data = {
@@ -223,7 +250,7 @@ async def stream_response(service, response, model, max_tokens):
                 }
                 if not service.history_disabled:
                     chunk_new_data.update({
-                        "message_id": current_message_id,
+                        "message_id": message_id,
                         "conversation_id": conversation_id,
                     })
                 completion_tokens += 1
@@ -240,7 +267,9 @@ async def stream_response(service, response, model, max_tokens):
 def get_url_from_content(content):
     if isinstance(content, str) and content.startswith('http'):
         try:
-            url = re.match(r'(?i)\b((?:[a-z][\w-]+:(?:/{1,3}|[a-z0-9%])|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»“”‘’]))', content.split(' ')[0])[0]
+            url = re.match(
+                r'(?i)\b((?:[a-z][\w-]+:(?:/{1,3}|[a-z0-9%])|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:\'".,<>?«»“”‘’]))',
+                content.split(' ')[0])[0]
             content = content.replace(url, '').strip()
             return url, content
         except Exception:
@@ -257,6 +286,8 @@ def format_messages_with_url(content):
             logger.info(f"Found a file_url from messages: {url}")
         else:
             break
+    if not url_list:
+        return content
     new_content = [
         {
             "type": "text",
@@ -280,7 +311,8 @@ async def api_messages_to_chat(service, api_messages, upload_by_url=False):
         role = api_message.get('role')
         content = api_message.get('content')
         if upload_by_url:
-            content = format_messages_with_url(content)
+            if isinstance(content, str):
+                content = format_messages_with_url(content)
         if isinstance(content, list):
             parts = []
             attachments = []
@@ -288,7 +320,7 @@ async def api_messages_to_chat(service, api_messages, upload_by_url=False):
             for i in content:
                 if i.get("type") == "text":
                     parts.append(i.get("text"))
-                if i.get("type") == "image_url":
+                elif i.get("type") == "image_url":
                     image_url = i.get("image_url")
                     url = image_url.get("url")
                     detail = image_url.get("detail", "auto")
